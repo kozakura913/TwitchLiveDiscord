@@ -179,7 +179,7 @@ async fn build_message_and_send(
 		&config,
 		&DiscordHookBody {
 			avatar_url: None, //未使用
-			content: "テスト中".into(),
+			content: "生放送が開始されました".into(),
 			embeds,
 		},
 	)
