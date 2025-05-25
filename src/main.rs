@@ -89,15 +89,15 @@ async fn async_exec() {
 	println!("{:?}", streams);
 	let e = match streams {
 		Ok(mut stream_list) => {
+			State {
+				auth: Some(api.auth.clone()),
+				lives: Some(stream_list.clone()),
+			}
+			.write();
 			if let Some(state) = &state {
 				state.trim(&mut stream_list);
 			}
-			build_message_and_send(&client, &config, stream_list.clone()).await;
-			State {
-				auth: Some(api.auth.clone()),
-				lives: Some(stream_list),
-			}
-			.write();
+			build_message_and_send(&client, &config, stream_list).await;
 			//一発成功
 			return;
 		}
@@ -131,13 +131,13 @@ async fn async_exec() {
 	println!("{:?}", streams);
 	match streams {
 		Ok(mut stream_list) => {
-			state.trim(&mut stream_list);
-			build_message_and_send(&client, &config, stream_list.clone()).await;
 			State {
 				auth: Some(api.auth.clone()),
-				lives: Some(stream_list),
+				lives: Some(stream_list.clone()),
 			}
 			.write();
+			state.trim(&mut stream_list);
+			build_message_and_send(&client, &config, stream_list).await;
 			//2回目で成功
 			return;
 		}
