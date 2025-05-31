@@ -1,4 +1,8 @@
-use std::collections::HashSet;
+use std::{
+	collections::{HashMap, HashSet},
+	path::Path,
+	time::Duration,
+};
 /*
  * SPDX-FileCopyrightText: 2025 Kozakura913 <kozakura@kzkr.xyz>
  * SPDX-License-Identifier: AGPL-3.0-only
@@ -9,8 +13,13 @@ use std::collections::HashSet;
  *  https://xn--vusz0j.art/@kozakura
 */
 use chrono::{DateTime, Utc};
-use reqwest::{Client, RequestBuilder};
+use reqwest::{
+	Client, RequestBuilder,
+	header::{CONTENT_TYPE, HeaderMap},
+	multipart,
+};
 use serde::{Deserialize, Serialize};
+use tokio_util::bytes::Bytes;
 
 fn main() {
 	tokio::runtime::Builder::new_current_thread()
@@ -54,13 +63,10 @@ impl State {
 struct ConfigFile {
 	client_id: String,
 	client_secret: String,
+	target_user: String,
 	discord: String,
 }
 async fn async_exec() {
-	let mut args = std::env::args();
-	args.next(); //自身のpath
-	let target_user = args.next();
-	let target_user = target_user.expect("ユーザー名文字列の指定が必要");
 	if !std::fs::exists("config.json").unwrap() {
 		let mut f = std::fs::File::create_new("config.json").expect("create example config.json");
 		serde_json::to_writer_pretty(
@@ -68,7 +74,8 @@ async fn async_exec() {
 			&ConfigFile {
 				client_id: "".into(),
 				client_secret: "".into(),
-				discord: "".into(),
+				target_user: "".into(),
+				discord: "https://discord.com/api/webhooks/".into(),
 			},
 		)
 		.expect("example config.json");
@@ -85,7 +92,7 @@ async fn async_exec() {
 		_ => login(&client, &config).await,
 	};
 	let api = TwitchAPI::new(auth, client.clone(), config.client_id.clone());
-	let streams = api.get_streams_by_name(&target_user).await;
+	let streams = api.get_streams_by_name(&config.target_user).await;
 	println!("{:?}", streams);
 	let e = match streams {
 		Ok(mut stream_list) => {
@@ -127,7 +134,7 @@ async fn async_exec() {
 	state.write();
 	//2回目
 	let api = TwitchAPI::new(auth, client.clone(), config.client_id.clone());
-	let streams = api.get_streams_by_name(&target_user).await;
+	let streams = api.get_streams_by_name(&config.target_user).await;
 	println!("{:?}", streams);
 	match streams {
 		Ok(mut stream_list) => {
@@ -147,6 +154,28 @@ async fn async_exec() {
 	};
 	//println!("{:?}",api.get_user_id(&target_user).await);
 }
+async fn get_thumbnail_image(client: &Client, stream: &LiveStream) -> Option<(HeaderMap, Bytes)> {
+	let base_url = stream.thumbnail_url.as_ref()?;
+	let thumbnail_url = base_url.replace("{width}", "0").replace("{height}", "0");
+	let request = client
+		.get(thumbnail_url)
+		.timeout(Duration::from_secs(5))
+		.build()
+		.map_err(|e| eprintln!("{}:{} {:?}", file!(), line!(), e))
+		.ok()?;
+	let response = client
+		.execute(request)
+		.await
+		.map_err(|e| eprintln!("{}:{} {:?}", file!(), line!(), e))
+		.ok()?;
+	let headers = response.headers().clone();
+	let bytes = response
+		.bytes()
+		.await
+		.map_err(|e| eprintln!("{}:{} {:?}", file!(), line!(), e))
+		.ok()?;
+	Some((headers, bytes))
+}
 async fn build_message_and_send(
 	client: &Client,
 	config: &ConfigFile,
@@ -155,35 +184,79 @@ async fn build_message_and_send(
 	if stream_list.data.is_empty() {
 		return;
 	}
+	let thumbnail_images = {
+		let get_thumbnail_image_job = stream_list
+			.data
+			.iter()
+			.map(|stream| get_thumbnail_image(client, stream));
+		let thumbnail_images = futures_util::future::join_all(get_thumbnail_image_job).await;
+		let mut map = HashMap::new();
+		let images = stream_list.data.iter().zip(thumbnail_images.into_iter());
+		for (stream, img) in images {
+			if let Some(img) = img {
+				let name = stream.thumbnail_name();
+				map.insert(stream.id.clone(), (img, name));
+			}
+		}
+		map
+	};
 	let mut embeds = Vec::new();
-	for stream in stream_list.data.into_iter() {
+	for stream in stream_list.data.iter() {
 		embeds.push(DiscordHookEmbed {
 			title: stream
 				.title
+				.clone()
 				.unwrap_or_else(|| stream.game_name.clone().unwrap_or("タイトル不明".into())),
 			url: Some(format!(
 				"https://www.twitch.tv/{}",
 				stream.user_login.as_str()
 			)),
-			description: stream.game_name,
+			description: stream.game_name.clone(),
 			timestamp: Some(stream.started_at),
-			image: stream.thumbnail_url.map(|base_url| DiscordHookEmbedImage {
-				url: base_url.replace("{width}", "0").replace("{height}", "0"),
-			}),
+			image: thumbnail_images
+				.get(stream.id.as_str())
+				.map(|(_, name)| DiscordHookEmbedImage { url: format!("attachment://{}",&name) }),
 			thumbnail: None,
 			color: None,
 		});
 	}
-	send_discord(
-		&client,
-		&config,
-		&DiscordHookBody {
-			avatar_url: None, //未使用
-			content: "生放送が開始されました".into(),
-			embeds,
-		},
-	)
-	.await;
+	let multipart_form = if !thumbnail_images.is_empty() {
+		let mut form = multipart::Form::new();
+		for ((header, b), name) in thumbnail_images.into_values() {
+			let len = b.len() as u64;
+			let part = multipart::Part::stream_with_length(b, len).file_name(name.clone());
+			if let Some(Ok(mime)) = header.get(CONTENT_TYPE).map(|mime| mime.to_str()) {
+				if let Ok(part) = part.mime_str(mime) {
+					form = form.part(name, part);
+				}
+			} else {
+				form = form.part(name, part);
+			}
+		}
+		Some(form)
+	} else {
+		None
+	};
+	let body = serde_json::to_string(&DiscordHookBody {
+		avatar_url: None, //未使用
+		content: "生放送が開始されました".into(),
+		embeds,
+	})
+	.unwrap();
+	let request = match multipart_form {
+		Some(form) => {
+			let form = form.text("payload_json", body);
+			client.post(&config.discord).multipart(form).build()
+		}
+		None => client
+			.post(&config.discord)
+			.header(CONTENT_TYPE, "application/json")
+			.body(body)
+			.build(),
+	}
+	.unwrap();
+	let response = client.execute(request).await.unwrap();
+	println!("send discord {}", response.status());
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DiscordHookBody {
@@ -209,17 +282,6 @@ struct DiscordHookEmbed {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DiscordHookEmbedImage {
 	url: String,
-}
-async fn send_discord(client: &Client, config: &ConfigFile, body: &DiscordHookBody) {
-	let body = serde_json::to_string(body).unwrap();
-	let request = client
-		.post(&config.discord)
-		.header("Content-Type", "application/json")
-		.body(body)
-		.build()
-		.unwrap();
-	let response = client.execute(request).await.unwrap();
-	println!("send discord {}", response.status());
 }
 async fn login(client: &Client, config: &ConfigFile) -> OAuthResponse {
 	println!("login...");
@@ -403,4 +465,17 @@ struct LiveStream {
 	thumbnail_url: Option<String>,
 	//成人向け？
 	is_mature: bool,
+}
+impl LiveStream {
+	fn thumbnail_name(&self) -> String {
+		let mut extension = "jpg";
+		if let Some(name) = self.thumbnail_url.as_ref() {
+			if let Some(Some(ext)) = Path::new(name).extension().map(|s| s.to_str()) {
+				if !ext.is_empty() {
+					extension = ext;
+				}
+			}
+		};
+		format!("{}.{}", &self.id, extension)
+	}
 }

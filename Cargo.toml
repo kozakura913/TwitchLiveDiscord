@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-reqwest = { version = "0.12", default-features = false , features = ["rustls-tls-native-roots", "charset"] }
+reqwest = { version = "0.12", default-features = false , features = ["rustls-tls-native-roots", "charset","multipart"] }
 tokio = { version = "1.0", features = ["rt-multi-thread"] }
 tokio-util = { version = "0.7.8", features = ["io"] }
 serde = {version="^1.0",features=["derive"]}
 serde_json ="1"
 chrono = {version="0.4",features=["serde"]}
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
